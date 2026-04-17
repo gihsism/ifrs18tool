@@ -54,7 +54,14 @@ def _ensure_dir(path: Path):
 # ---------------------------------------------------------------------------
 
 def save_session(project_name: str = "autosave"):
-    """Save current session state to disk."""
+    """Save current session state to disk. Silently fails on read-only filesystems."""
+    try:
+        _save_session_inner(project_name)
+    except Exception:
+        pass  # Read-only filesystem (e.g. Streamlit Cloud) — skip silently
+
+
+def _save_session_inner(project_name: str):
     proj = _project_dir(project_name)
     _ensure_dir(proj)
 
