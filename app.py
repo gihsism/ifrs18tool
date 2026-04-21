@@ -26,9 +26,12 @@ from modules.persistence import (
     load_session,
 )
 from modules.auth import render_auth_sidebar, auth_configured, user_email
+from modules.ui_theme import inject_theme
 
 
 def main():
+    inject_theme()
+
     # Auto-load previous session on startup
     auto_load_if_needed()
 
