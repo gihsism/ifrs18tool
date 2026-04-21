@@ -4,3 +4,5 @@ __pycache__/
 .ifrs18_projects/
 .vercel/
 .streamlit/secrets.toml
+node_modules/
+cloudflare-worker/.wrangler/
