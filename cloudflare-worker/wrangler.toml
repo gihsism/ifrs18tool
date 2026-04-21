@@ -1,0 +1,10 @@
+name = "ifrs18-proxy"
+main = "src/worker.ts"
+compatibility_date = "2025-04-01"
+
+# Intercept the app's path on alenanikolskaia.com. Everything else is
+# untouched and reaches Vercel as normal.
+routes = [
+  { pattern = "alenanikolskaia.com/IFRS18analysis", zone_name = "alenanikolskaia.com" },
+  { pattern = "alenanikolskaia.com/IFRS18analysis/*", zone_name = "alenanikolskaia.com" },
+]
