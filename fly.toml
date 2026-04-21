@@ -7,9 +7,10 @@ primary_region = "ams"
 [http_service]
   internal_port = 8501
   force_https = true
+  # Keep one machine warm to avoid cold starts; allow scale-down of extras.
   auto_stop_machines = "stop"
   auto_start_machines = true
-  min_machines_running = 0
+  min_machines_running = 1
 
 [[vm]]
   memory = "1gb"
