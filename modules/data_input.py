@@ -148,8 +148,17 @@ def _load_file(uploaded):
     return None, None
 
 
-def _process_and_store(df: pd.DataFrame, entity_type: str):
-    """Auto-detect, classify, and store data split by statement type."""
+def _process_and_store(df: pd.DataFrame, entity_type: str, source: dict | None = None):
+    """Auto-detect, classify, and store data split by statement type.
+
+    When `source` is provided, also stores the raw pre-classification frame
+    and its source metadata so the upload can be reanalyzed later.
+    """
+    # Clear previously-classified statements so a reanalysis doesn't leave
+    # stale data from a different upload in session state.
+    for key in ("classified_pnl", "classified_bs", "classified_cf"):
+        st.session_state.pop(key, None)
+
     classified = auto_classify(df, entity_type)
 
     # Split by statement type and store
@@ -160,6 +169,11 @@ def _process_and_store(df: pd.DataFrame, entity_type: str):
 
     st.session_state["all_classified"] = classified
     st.session_state["loaded_statements"] = set(classified["Statement"].unique())
+
+    # Remember the raw upload so the user can reanalyze it later
+    if source is not None:
+        st.session_state["raw_upload"] = df.copy()
+        st.session_state["raw_upload_source"] = source
 
     # Auto-save to disk
     from modules.persistence import auto_save
@@ -185,6 +199,8 @@ def render_data_input():
     )
 
     entity_type = st.session_state.get("entity_type", "General (non-financial)")
+
+    _render_previous_upload(entity_type)
 
     tab_upload, tab_sample = st.tabs(["Upload File(s)", "Use Sample Data"])
 
@@ -216,7 +232,15 @@ def render_data_input():
 
         if files:
             all_dfs = []
+            file_bytes: dict[str, bytes] = {}
             for uploaded in files:
+                # Capture raw bytes for persistence / later reanalysis
+                try:
+                    uploaded.seek(0)
+                    file_bytes[uploaded.name] = uploaded.read()
+                    uploaded.seek(0)
+                except Exception:
+                    pass
                 with st.spinner(f"Processing {uploaded.name}..."):
                     df, tables = _load_file(uploaded)
 
@@ -294,7 +318,10 @@ def render_data_input():
 
             if all_dfs and st.button("Confirm & Classify All", type="primary"):
                 combined = pd.concat(all_dfs, ignore_index=True)
-                _process_and_store(combined, entity_type)
+                if file_bytes:
+                    st.session_state["raw_upload_files_bytes"] = file_bytes
+                source = {"type": "files", "names": [f.name for f in files]}
+                _process_and_store(combined, entity_type, source=source)
                 st.rerun()
 
     with tab_sample:
@@ -303,22 +330,38 @@ def render_data_input():
         col1, col2, col3, col4 = st.columns(4)
         with col1:
             if st.button("Load Sample P&L"):
-                _process_and_store(SAMPLE_PNL.copy(), entity_type)
+                st.session_state.pop("raw_upload_files_bytes", None)
+                _process_and_store(
+                    SAMPLE_PNL.copy(), entity_type,
+                    source={"type": "sample", "names": ["Sample P&L"]},
+                )
                 st.rerun()
         with col2:
             if st.button("Load Sample BS"):
-                _process_and_store(SAMPLE_BS.copy(), entity_type)
+                st.session_state.pop("raw_upload_files_bytes", None)
+                _process_and_store(
+                    SAMPLE_BS.copy(), entity_type,
+                    source={"type": "sample", "names": ["Sample BS"]},
+                )
                 st.rerun()
         with col3:
             if st.button("Load Sample CF"):
-                _process_and_store(SAMPLE_CF.copy(), entity_type)
+                st.session_state.pop("raw_upload_files_bytes", None)
+                _process_and_store(
+                    SAMPLE_CF.copy(), entity_type,
+                    source={"type": "sample", "names": ["Sample CF"]},
+                )
                 st.rerun()
         with col4:
             if st.button("Load All Three"):
+                st.session_state.pop("raw_upload_files_bytes", None)
                 combined = pd.concat([
                     SAMPLE_PNL.copy(), SAMPLE_BS.copy(), SAMPLE_CF.copy(),
                 ], ignore_index=True)
-                _process_and_store(combined, entity_type)
+                _process_and_store(
+                    combined, entity_type,
+                    source={"type": "sample", "names": ["Sample P&L", "Sample BS", "Sample CF"]},
+                )
                 st.rerun()
 
     # --- Current status ---
@@ -336,3 +379,58 @@ def render_data_input():
                     st.dataframe(df, use_container_width=True, hide_index=True)
 
         st.sidebar.success(f"Loaded: {', '.join(sorted(loaded))}")
+
+
+def _render_previous_upload(entity_type: str):
+    """Show the last saved upload with a button to rerun the analysis."""
+    raw = st.session_state.get("raw_upload")
+    source = st.session_state.get("raw_upload_source") or {}
+    if not isinstance(raw, pd.DataFrame) or raw.empty:
+        return
+
+    src_type = source.get("type", "upload")
+    names = source.get("names") or []
+    label = "Sample data" if src_type == "sample" else "Uploaded file(s)"
+
+    with st.container(border=True):
+        st.markdown(f"**Previous {label.lower()}** — {len(raw)} rows")
+        if names:
+            st.caption(", ".join(names))
+
+        col_a, col_b, col_c = st.columns([1, 1, 1])
+        with col_a:
+            if st.button(
+                "Reanalyze",
+                type="primary",
+                help="Re-run classification on the previous upload "
+                     "(useful after changing entity type).",
+            ):
+                _process_and_store(raw.copy(), entity_type, source=source)
+                st.success("Reanalyzed with current entity settings.")
+                st.rerun()
+        with col_b:
+            with st.popover("Preview data"):
+                st.dataframe(raw, use_container_width=True, hide_index=True)
+        with col_c:
+            if st.button("Clear previous upload"):
+                for key in (
+                    "raw_upload",
+                    "raw_upload_source",
+                    "raw_upload_files_bytes",
+                ):
+                    st.session_state.pop(key, None)
+                from modules.persistence import auto_save
+                auto_save()
+                st.rerun()
+
+        # Offer downloads of the original uploaded files, if available
+        file_bytes = st.session_state.get("raw_upload_files_bytes") or {}
+        if file_bytes:
+            with st.expander("Original files"):
+                for fname, data in file_bytes.items():
+                    st.download_button(
+                        f"Download {fname}",
+                        data=data,
+                        file_name=fname,
+                        key=f"dl_raw_{fname}",
+                    )

@@ -5,6 +5,7 @@ to a local `.ifrs18_projects/` directory as parquet + JSON.
 On app start, automatically restores the last session.
 """
 
+import base64
 import json
 import os
 import shutil
@@ -23,6 +24,7 @@ _DF_KEYS = [
     "classified_bs",
     "classified_cf",
     "all_classified",
+    "raw_upload",
 ]
 
 # Session state keys that hold JSON-serialisable data
@@ -33,6 +35,7 @@ _JSON_KEYS = [
     "_transition_notes",
     "expense_presentation",
     "classifications_confirmed",
+    "raw_upload_source",
 ]
 
 # Keys that hold sets (need list conversion for JSON)
@@ -54,11 +57,25 @@ def _ensure_dir(path: Path):
 # ---------------------------------------------------------------------------
 
 def save_session(project_name: str = "autosave"):
-    """Save current session state to disk. Silently fails on read-only filesystems."""
+    """Save current session state to disk. Silently fails on read-only filesystems.
+
+    If the user is signed in and GCS is configured, also push a zipped copy
+    to cloud storage so the project survives across sessions and devices.
+    """
     try:
         _save_session_inner(project_name)
     except Exception:
         pass  # Read-only filesystem (e.g. Streamlit Cloud) — skip silently
+
+    # Cloud sync (best-effort)
+    try:
+        from modules.auth import user_email
+        from modules.cloud_storage import upload_project
+        email = user_email()
+        if email:
+            upload_project(email, project_name, _project_dir(project_name))
+    except Exception:
+        pass
 
 
 def _save_session_inner(project_name: str):
@@ -96,6 +113,21 @@ def _save_session_inner(project_name: str):
         with open(proj / "state.json", "w") as f:
             json.dump(json_state, f, indent=2, default=str)
 
+    # Save original uploaded file bytes (if any) under raw_files/
+    raw_files = st.session_state.get("raw_upload_files_bytes")
+    if isinstance(raw_files, dict) and raw_files:
+        raw_dir = proj / "raw_files"
+        # Reset directory so removed files don't linger
+        if raw_dir.exists():
+            shutil.rmtree(raw_dir)
+        _ensure_dir(raw_dir)
+        for fname, data in raw_files.items():
+            try:
+                with open(raw_dir / fname, "wb") as f:
+                    f.write(data)
+            except Exception:
+                pass
+
     # Save metadata
     meta = {
         "saved_at": datetime.now().isoformat(),
@@ -116,8 +148,24 @@ def _save_session_inner(project_name: str):
 # ---------------------------------------------------------------------------
 
 def load_session(project_name: str = "autosave") -> bool:
-    """Load session state from disk. Returns True if data was loaded."""
+    """Load session state from disk. Returns True if data was loaded.
+
+    If signed in, pulls the cloud copy down first so the local directory
+    reflects the latest cross-device state before reading.
+    """
     proj = _project_dir(project_name)
+
+    # Pull from cloud first when signed in — overwrites local copy so the
+    # most recent cross-device save wins.
+    try:
+        from modules.auth import user_email
+        from modules.cloud_storage import download_project
+        email = user_email()
+        if email:
+            download_project(email, project_name, proj)
+    except Exception:
+        pass
+
     if not proj.exists():
         return False
 
@@ -161,6 +209,20 @@ def load_session(project_name: str = "autosave") -> bool:
         except Exception:
             pass
 
+    # Load original uploaded file bytes
+    raw_dir = proj / "raw_files"
+    if raw_dir.exists():
+        files_bytes = {}
+        for f in raw_dir.iterdir():
+            if f.is_file():
+                try:
+                    files_bytes[f.name] = f.read_bytes()
+                except Exception:
+                    pass
+        if files_bytes:
+            st.session_state["raw_upload_files_bytes"] = files_bytes
+            loaded_any = True
+
     return loaded_any
 
 
@@ -182,27 +244,59 @@ def has_saved_session(project_name: str = "autosave") -> bool:
 
 
 def delete_session(project_name: str = "autosave"):
-    """Delete a saved project."""
+    """Delete a saved project, locally and in the cloud."""
     proj = _project_dir(project_name)
     if proj.exists():
         shutil.rmtree(proj)
+    try:
+        from modules.auth import user_email
+        from modules.cloud_storage import delete_project
+        email = user_email()
+        if email:
+            delete_project(email, project_name)
+    except Exception:
+        pass
 
 
 def list_projects() -> list[dict]:
-    """List all saved projects with metadata."""
-    if not PROJECTS_DIR.exists():
-        return []
-    projects = []
-    for d in sorted(PROJECTS_DIR.iterdir()):
-        if d.is_dir() and (d / "meta.json").exists():
-            try:
-                with open(d / "meta.json") as f:
-                    meta = json.load(f)
-                meta["dir_name"] = d.name
-                projects.append(meta)
-            except Exception:
-                pass
-    return projects
+    """List saved projects with metadata.
+
+    When signed in, merges local projects with cloud projects. Cloud-only
+    projects are downloaded on demand when the user clicks them.
+    """
+    projects: dict[str, dict] = {}
+
+    if PROJECTS_DIR.exists():
+        for d in sorted(PROJECTS_DIR.iterdir()):
+            if d.is_dir() and (d / "meta.json").exists():
+                try:
+                    with open(d / "meta.json") as f:
+                        meta = json.load(f)
+                    meta["dir_name"] = d.name
+                    meta["location"] = "local"
+                    projects[d.name] = meta
+                except Exception:
+                    pass
+
+    try:
+        from modules.auth import user_email
+        from modules.cloud_storage import list_project_names
+        email = user_email()
+        if email:
+            for name in list_project_names(email):
+                if name in projects:
+                    projects[name]["location"] = "synced"
+                else:
+                    projects[name] = {
+                        "dir_name": name,
+                        "project_name": name,
+                        "saved_at": "cloud",
+                        "location": "cloud",
+                    }
+    except Exception:
+        pass
+
+    return list(projects.values())
 
 
 # ---------------------------------------------------------------------------
@@ -226,7 +320,11 @@ def auto_save():
 # ---------------------------------------------------------------------------
 
 def auto_load_if_needed():
-    """Load autosaved session if no data is currently in session state."""
+    """Load autosaved session if no data is currently in session state.
+
+    When signed in, tries to pull the cloud autosave first so returning
+    users (including from a different device) see their last project.
+    """
     if "_persistence_loaded" in st.session_state:
         return  # already attempted
 
@@ -240,6 +338,15 @@ def auto_load_if_needed():
     )
     if has_data:
         return
+
+    try:
+        from modules.auth import user_email
+        from modules.cloud_storage import download_project
+        email = user_email()
+        if email:
+            download_project(email, "autosave", _project_dir("autosave"))
+    except Exception:
+        pass
 
     if has_saved_session("autosave"):
         load_session("autosave")

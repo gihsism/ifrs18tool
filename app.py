@@ -25,6 +25,7 @@ from modules.persistence import (
     list_projects,
     load_session,
 )
+from modules.auth import render_auth_sidebar, auth_configured, user_email
 
 
 def main():
@@ -62,6 +63,11 @@ def main():
         "classify related income/expenses as operating.",
     )
     st.session_state["entity_type"] = entity_type
+
+    # Auth controls in sidebar
+    st.sidebar.markdown("---")
+    st.sidebar.header("Account")
+    render_auth_sidebar()
 
     # Save/Load controls in sidebar
     st.sidebar.markdown("---")
@@ -105,6 +111,14 @@ def _render_project_controls():
             save_session(proj_name)
             st.success(f"Saved as '{proj_name}'")
 
+        # Nudge anonymous users when auth is available but they're not signed in
+        if auth_configured() and not user_email():
+            st.info(
+                "Sign in (top of sidebar) to keep your projects across "
+                "sessions and devices.",
+                icon="☁️",
+            )
+
         # List saved projects
         projects = list_projects()
         if projects:
@@ -112,19 +126,24 @@ def _render_project_controls():
             for p in projects:
                 name = p.get("dir_name", "?")
                 saved = p.get("saved_at", "?")
+                location = p.get("location", "local")
                 try:
                     from datetime import datetime
                     dt = datetime.fromisoformat(saved)
                     saved = f"{dt:%Y-%m-%d %H:%M}"
                 except Exception:
                     pass
+                badge = {"local": "", "synced": " · ☁️", "cloud": " · ☁️"}.get(location, "")
                 col1, col2 = st.columns([3, 1])
                 with col1:
                     if st.button(f"{name}", key=f"load_{name}"):
                         load_session(name)
                         st.rerun()
                 with col2:
-                    st.caption(saved)
+                    st.caption(f"{saved}{badge}")
+
+    # Download / upload zip — universal fallback for users who don't sign in
+    _render_zip_transfer()
 
     # Clear
     if st.sidebar.button("Clear All Data"):
@@ -133,6 +152,64 @@ def _render_project_controls():
                 del st.session_state[key]
         delete_session("autosave")
         st.rerun()
+
+
+def _render_zip_transfer():
+    """Download current session as zip / upload a previously saved zip.
+
+    Works for every user regardless of sign-in state. A safety net so nobody
+    is locked out of saving their work.
+    """
+    from modules.persistence import PROJECTS_DIR, _project_dir, auto_save
+    from pathlib import Path
+    import io
+    import zipfile
+
+    with st.sidebar.expander("Download / Upload as file"):
+        st.caption(
+            "Export your project as a `.zip` to save anywhere (Box, SharePoint, "
+            "email). Upload it later to restore."
+        )
+
+        # Download: zip the autosave project dir in memory
+        autosave_dir = _project_dir("autosave")
+        if autosave_dir.exists():
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+                for p in autosave_dir.rglob("*"):
+                    if p.is_file():
+                        z.write(p, arcname=p.relative_to(autosave_dir))
+            st.download_button(
+                "Download current project",
+                data=buf.getvalue(),
+                file_name="ifrs18_project.zip",
+                mime="application/zip",
+                key="dl_proj_zip",
+            )
+        else:
+            st.caption("Nothing to download yet — load data first.")
+
+        # Upload: accept a zip, extract into autosave dir, rerun
+        uploaded = st.file_uploader(
+            "Restore from file", type=["zip"], key="upload_proj_zip",
+            label_visibility="collapsed",
+        )
+        if uploaded is not None and st.button("Restore this file", key="restore_btn"):
+            try:
+                if autosave_dir.exists():
+                    import shutil
+                    shutil.rmtree(autosave_dir)
+                autosave_dir.mkdir(parents=True, exist_ok=True)
+                with zipfile.ZipFile(io.BytesIO(uploaded.read())) as z:
+                    z.extractall(autosave_dir)
+                # Clear in-memory state so load_session repopulates cleanly
+                for k in list(st.session_state.keys()):
+                    if k != "_persistence_loaded":
+                        del st.session_state[k]
+                load_session("autosave")
+                st.rerun()
+            except Exception as e:
+                st.error(f"Could not restore: {e}")
 
 
 if __name__ == "__main__":

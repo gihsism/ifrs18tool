@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .ifrs18_projects/
 .vercel/
+.streamlit/secrets.toml
