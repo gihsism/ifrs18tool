@@ -380,6 +380,12 @@ def render_data_input():
 
         st.sidebar.success(f"Loaded: {', '.join(sorted(loaded))}")
 
+        # Entity context — auto-extracts what it can, prompts for the rest.
+        # Its answers feed the classifier in Step 2 (P&L) and all later steps.
+        st.markdown("---")
+        from modules.entity_context import render_context_form
+        render_context_form()
+
 
 def _render_previous_upload(entity_type: str):
     """Show the last saved upload with a button to rerun the analysis."""
