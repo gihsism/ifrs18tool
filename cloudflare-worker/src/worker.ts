@@ -14,7 +14,7 @@
  * CSRF block on file uploads.
  */
 
-const UPSTREAM_HOST = "gihsism-ifrs18tool-app-lcitfr.streamlit.app";
+const UPSTREAM_HOST = "ifrs18tool.fly.dev";
 const APP_PREFIX = "/IFRS18analysis";
 
 export default {
