@@ -290,6 +290,54 @@ def _extract_and_store_notes():
     st.session_state["notes_corpus"] = notes
     st.session_state["note_references"] = refs_by_stmt
 
+    # Re-classify any P&L rows that reference a note, using the note text
+    # as additional context. Mostly matters for ambiguous items like
+    # "Interest" or "Other income" where the category depends on what's
+    # actually inside the note.
+    _reclassify_with_notes(refs_by_stmt, notes, entity_type)
+
+
+def _reclassify_with_notes(
+    refs_by_stmt: dict[str, dict[int, list[int]]],
+    notes_corpus: dict[int, dict],
+    entity_type: str,
+):
+    """Override classifications using note text where a row links to one."""
+    from modules.ifrs18_categories import classify_pnl_item
+    from modules.notes_parser import note_context_for
+
+    pnl_refs = refs_by_stmt.get("classified_pnl") or {}
+    if not pnl_refs:
+        return
+
+    df = st.session_state.get("classified_pnl")
+    if df is None or df.empty:
+        return
+
+    df = df.copy()
+    changed = 0
+    for row_idx, note_nums in pnl_refs.items():
+        if row_idx >= len(df):
+            continue
+        ctx = note_context_for(notes_corpus, note_nums)
+        if not ctx:
+            continue
+        acct = str(df.iloc[row_idx]["Account"])
+        new_cat = classify_pnl_item(acct, entity_type, note_context=ctx).value
+        if new_cat != df.iloc[row_idx].get("Category"):
+            df.iat[row_idx, df.columns.get_loc("Category")] = new_cat
+            changed += 1
+    if changed:
+        st.session_state["classified_pnl"] = df
+        # Also refresh the all_classified mirror so the export step stays
+        # in sync with the per-statement views.
+        all_df = st.session_state.get("all_classified")
+        if isinstance(all_df, pd.DataFrame) and not all_df.empty:
+            all_df = all_df.copy()
+            mask = all_df["Statement"] == "Profit or Loss"
+            all_df.loc[mask, "Category"] = df["Category"].values[:mask.sum()]
+            st.session_state["all_classified"] = all_df
+
 
 def _stmt_key(stmt_type: str) -> str:
     """Session state key for a statement type."""

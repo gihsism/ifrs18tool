@@ -183,10 +183,23 @@ BS_CLASSIFICATION_RULES = {
 # ===================================================================
 
 def classify_pnl_item(
-    description: str, entity_type: str = "General (non-financial)"
+    description: str,
+    entity_type: str = "General (non-financial)",
+    note_context: str = "",
 ) -> IFRS18Category:
-    """Classify a P&L line item into an IFRS 18 category."""
-    desc_lower = description.lower().strip()
+    """Classify a P&L line item into an IFRS 18 category.
+
+    `note_context` is optional text from the supporting footnote — used to
+    disambiguate items like "Interest" or "Other income" whose category
+    depends on what's *behind* the line. We restrict the note context to
+    the first ~500 chars to keep the keyword scan tight and avoid spurious
+    matches deep inside a long disclosure narrative.
+    """
+    base = description.lower().strip()
+    desc_lower = (
+        base + " " + note_context[:500].lower()
+        if note_context else base
+    )
 
     # Financial entity overrides -> Operating
     if entity_type != "General (non-financial)":

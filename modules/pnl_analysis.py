@@ -358,6 +358,72 @@ The following must be disclosed by nature when function presentation is used:
         st.dataframe(pd.DataFrame(preview), use_container_width=True, hide_index=True)
         st.caption(f"Reduced from {len(df)} to {len(preview)} line items")
 
+    _render_note_disaggregation(df, col)
+
+
+def _render_note_disaggregation(df, col):
+    """Show the breakdown from each referenced note alongside the P&L line.
+
+    Pulls from the notes corpus and references built during upload — gives
+    the user the by-nature / by-component view that IFRS 18 disaggregation
+    relies on, without leaving the P&L page.
+    """
+    import streamlit as st
+    refs = (st.session_state.get("note_references") or {}).get("classified_pnl") or {}
+    notes = st.session_state.get("notes_corpus") or {}
+    if not refs or not notes:
+        return
+
+    st.markdown("---")
+    st.markdown("#### Disaggregation from Notes")
+    st.caption(
+        "P&L lines that reference a footnote, with the structured breakdown "
+        "extracted from that note. This is what IFRS 18 disaggregation should "
+        "draw on — the underlying components, not the face-of-statement total."
+    )
+
+    shown_any = False
+    for row_idx, note_nums in sorted(refs.items()):
+        if row_idx >= len(df):
+            continue
+        try:
+            acct = str(df.iloc[row_idx]["Account"])
+            amount = df.iloc[row_idx][col]
+            category = df.iloc[row_idx].get("Category", "—")
+        except Exception:
+            continue
+
+        for n in note_nums:
+            note = notes.get(int(n))
+            if not note:
+                continue
+            shown_any = True
+            title = note.get("title") or ""
+            tables = note.get("tables") or []
+            text = (note.get("text") or "").strip()
+            with st.expander(
+                f"**{acct}** — {category} — {amount:,.0f}  →  Note {n}: {title}",
+                expanded=False,
+            ):
+                if tables:
+                    for ti, tbl in enumerate(tables):
+                        st.markdown(
+                            f"_Table {ti + 1} from Note {n}:_"
+                            if len(tables) > 1 else
+                            f"_Breakdown from Note {n}:_"
+                        )
+                        st.dataframe(tbl, use_container_width=True, hide_index=True)
+                elif text:
+                    st.markdown(
+                        "_No structured table extracted; narrative text:_"
+                    )
+                    st.write(text[:1500] + ("…" if len(text) > 1500 else ""))
+                else:
+                    st.caption("_(note content empty)_")
+
+    if not shown_any:
+        st.caption("_No P&L lines reference a captured note._")
+
 
 # ===================================================================
 # Tab 3: IFRS 18 Income Statement

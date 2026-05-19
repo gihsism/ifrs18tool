@@ -306,6 +306,27 @@ def enrich_notes_with_docai(
     return notes
 
 
+def note_context_for(
+    notes_corpus: dict[int, dict],
+    note_nums: list[int],
+    max_chars: int = 400,
+) -> str:
+    """Concatenate title + text from the given notes into a single context
+    string for the classifier. Capped to keep keyword scans tight."""
+    parts: list[str] = []
+    for n in note_nums:
+        note = notes_corpus.get(int(n))
+        if not note:
+            continue
+        title = (note.get("title") or "").strip()
+        text = (note.get("text") or "").strip()
+        if title:
+            parts.append(title)
+        if text:
+            parts.append(text[:max_chars])
+    return " ".join(parts)
+
+
 def _docai_doc_to_tables(doc) -> list[pd.DataFrame]:
     """Pull tables out of a DocAI Document response as DataFrames."""
     full_text = doc.text or ""
