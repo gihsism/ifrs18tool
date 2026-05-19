@@ -56,15 +56,21 @@ _NOTES_SECTION_MARKERS = [
     "notes to the accounts",
 ]
 
-# A note heading looks like "1. Revenue", "12 Other operating expenses",
-# "Note 4: Property, plant and equipment", "Note 1 – Revenue". We require:
-#  - a number 1-999 at the start of the line
+# A note heading looks like one of:
+#   1. Revenue
+#   12 Other operating expenses
+#   Note 4: Property, plant and equipment
+#   Note 1 – Revenue
+#   (26) Business segment data       ← Berkshire / US-GAAP style
+#   [3] Investments                  ← rare bracketed style
+# We require:
+#  - a number 1-999 at the start of the line, optionally wrapped in ( ) or [ ]
 #  - optional "Note" prefix, optional punctuation after the number
 #    (periods, parens, colons, hyphens, en/em dashes)
 #  - a title of at least 3 characters starting with an uppercase letter
 #  - line ends after the title (no trailing amounts — that's a table row)
 _NOTE_HEADING_RE = re.compile(
-    r"^\s*(?:note\s+)?(\d{1,3})\s*[\.\)\:\-–—]?\s+"
+    r"^\s*(?:note\s+)?[\(\[]?(\d{1,3})[\)\]]?\s*[\.\:\-–—]?\s+"
     r"([A-Z][A-Za-z0-9 &,\-/'()–—]{2,120})\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
