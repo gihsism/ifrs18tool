@@ -44,6 +44,73 @@ _SET_KEYS = [
 ]
 
 
+def _notes_corpus_to_json(corpus: dict) -> dict:
+    """Convert notes_corpus (with DataFrame tables) to JSON-safe form."""
+    out = {}
+    for num, note in corpus.items():
+        tables = []
+        for tbl in note.get("tables") or []:
+            if isinstance(tbl, pd.DataFrame):
+                tables.append({
+                    "columns": [str(c) for c in tbl.columns],
+                    "rows": tbl.astype(str).values.tolist(),
+                })
+        out[str(num)] = {
+            "title": note.get("title", ""),
+            "page_start": note.get("page_start"),
+            "page_end": note.get("page_end"),
+            "text": note.get("text", ""),
+            "tables": tables,
+        }
+    return out
+
+
+def _notes_corpus_from_json(data: dict) -> dict:
+    """Inverse of _notes_corpus_to_json — restore DataFrames."""
+    out = {}
+    for k, v in (data or {}).items():
+        try:
+            num = int(k)
+        except (TypeError, ValueError):
+            continue
+        tables = []
+        for t in v.get("tables") or []:
+            try:
+                tables.append(pd.DataFrame(t.get("rows") or [], columns=t.get("columns") or []))
+            except Exception:
+                pass
+        out[num] = {
+            "title": v.get("title", ""),
+            "page_start": v.get("page_start"),
+            "page_end": v.get("page_end"),
+            "text": v.get("text", ""),
+            "tables": tables,
+        }
+    return out
+
+
+def _note_refs_to_json(refs: dict) -> dict:
+    """note_references is {stmt_key: {row_idx(int): [note_nums(int)]}}. JSON
+    keys can't be ints, so stringify the row indexes."""
+    return {
+        stmt: {str(idx): list(nums) for idx, nums in (rows or {}).items()}
+        for stmt, rows in (refs or {}).items()
+    }
+
+
+def _note_refs_from_json(data: dict) -> dict:
+    out: dict = {}
+    for stmt, rows in (data or {}).items():
+        row_map: dict[int, list[int]] = {}
+        for idx, nums in (rows or {}).items():
+            try:
+                row_map[int(idx)] = [int(n) for n in nums]
+            except (TypeError, ValueError):
+                continue
+        out[stmt] = row_map
+    return out
+
+
 def _project_dir(name: str) -> Path:
     return PROJECTS_DIR / name
 
@@ -112,6 +179,19 @@ def _save_session_inner(project_name: str):
     if json_state:
         with open(proj / "state.json", "w") as f:
             json.dump(json_state, f, indent=2, default=str)
+
+    # Notes corpus + references (separate file; can be large).
+    notes_corpus = st.session_state.get("notes_corpus")
+    note_refs = st.session_state.get("note_references")
+    if notes_corpus or note_refs:
+        with open(proj / "notes.json", "w") as f:
+            json.dump(
+                {
+                    "notes_corpus": _notes_corpus_to_json(notes_corpus or {}),
+                    "note_references": _note_refs_to_json(note_refs or {}),
+                },
+                f, indent=2, default=str,
+            )
 
     # Save original uploaded file bytes (if any) under raw_files/
     raw_files = st.session_state.get("raw_upload_files_bytes")
@@ -206,6 +286,23 @@ def load_session(project_name: str = "autosave") -> bool:
                 if key in json_state:
                     st.session_state[key] = set(json_state[key])
                     loaded_any = True
+        except Exception:
+            pass
+
+    # Load notes corpus + references.
+    notes_path = proj / "notes.json"
+    if notes_path.exists():
+        try:
+            with open(notes_path) as f:
+                notes_data = json.load(f)
+            corpus = _notes_corpus_from_json(notes_data.get("notes_corpus") or {})
+            if corpus:
+                st.session_state["notes_corpus"] = corpus
+                loaded_any = True
+            refs = _note_refs_from_json(notes_data.get("note_references") or {})
+            if refs:
+                st.session_state["note_references"] = refs
+                loaded_any = True
         except Exception:
             pass
 
@@ -304,14 +401,21 @@ def list_projects() -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def auto_save():
-    """Auto-save if there's data worth saving."""
+    """Auto-save if there's data worth saving.
+
+    Triggers on classified DataFrames OR raw uploaded files OR notes corpus —
+    so a freshly-uploaded PDF survives container restarts even before the
+    user runs classification.
+    """
     has_data = any(
         key in st.session_state
         and isinstance(st.session_state.get(key), pd.DataFrame)
         and not st.session_state[key].empty
         for key in _DF_KEYS
     )
-    if has_data:
+    has_files = bool(st.session_state.get("raw_upload_files_bytes"))
+    has_notes = bool(st.session_state.get("notes_corpus"))
+    if has_data or has_files or has_notes:
         save_session("autosave")
 
 

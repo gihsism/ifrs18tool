@@ -1,4 +1,5 @@
-"""Step 1: Data Input — Upload financial statements with auto-detection."""
+"""Step 1: Data Input & Classification — Upload financial statements,
+auto-detect statement type, and review/adjust IFRS 18 classifications inline."""
 
 import streamlit as st
 import pandas as pd
@@ -9,6 +10,7 @@ from modules.doc_parser import (
     _ocr_available,
 )
 from modules.statement_detector import detect_table_type, auto_classify
+from modules.classification import render_classification
 
 
 # ---------------------------------------------------------------------------
@@ -156,7 +158,10 @@ def _process_and_store(df: pd.DataFrame, entity_type: str, source: dict | None =
     """
     # Clear previously-classified statements so a reanalysis doesn't leave
     # stale data from a different upload in session state.
-    for key in ("classified_pnl", "classified_bs", "classified_cf"):
+    for key in (
+        "classified_pnl", "classified_bs", "classified_cf",
+        "notes_corpus", "note_references",
+    ):
         st.session_state.pop(key, None)
 
     classified = auto_classify(df, entity_type)
@@ -175,9 +180,115 @@ def _process_and_store(df: pd.DataFrame, entity_type: str, source: dict | None =
         st.session_state["raw_upload"] = df.copy()
         st.session_state["raw_upload_source"] = source
 
+    # Extract notes corpus from the original PDF (if any). Runs inline so the
+    # user sees notes ready by the time they navigate to Step 2.
+    _extract_and_store_notes()
+
     # Auto-save to disk
     from modules.persistence import auto_save
     auto_save()
+
+
+def _reextract_from_saved_files(entity_type: str):
+    """Re-run the full upload pipeline on the originally-uploaded file bytes.
+
+    Used by the Reanalyse button — applies the current parser version (DocAI,
+    heuristics, notes extraction) to a previously-uploaded file without
+    requiring the user to re-upload it.
+    """
+    import io as _io
+
+    file_bytes = st.session_state.get("raw_upload_files_bytes") or {}
+    if not file_bytes:
+        return
+
+    all_dfs: list[pd.DataFrame] = []
+    names: list[str] = []
+    for fname, data in file_bytes.items():
+        wrapped = _io.BytesIO(data)
+        wrapped.name = fname
+        with st.spinner(f"Re-extracting {fname}..."):
+            df, tables = _load_file(wrapped)
+        names.append(fname)
+        if tables:
+            # PDF / DOCX / image — take every extracted table; we already
+            # auto-rank/dedupe them inside the parser.
+            all_dfs.extend(tables)
+        elif df is not None and len(df) > 0:
+            # CSV / Excel — best-effort: keep first column as Account, treat
+            # remaining numeric columns as periods. Lossy for files where the
+            # user previously did manual column mapping; re-upload if so.
+            mapped = df.copy()
+            cols = list(mapped.columns)
+            if cols:
+                mapped.columns = ["Account"] + [
+                    f"Year {i + 1}" for i in range(len(cols) - 1)
+                ]
+            for col in mapped.columns[1:]:
+                mapped[col] = pd.to_numeric(mapped[col], errors="coerce").fillna(0)
+            all_dfs.append(mapped)
+
+    if not all_dfs:
+        st.warning(
+            "Re-extraction returned no tables. The original files may be "
+            "scanned-only or in a format the new pipeline can't read."
+        )
+        return
+
+    combined = pd.concat(all_dfs, ignore_index=True)
+    _process_and_store(
+        combined, entity_type,
+        source={"type": "files", "names": names},
+    )
+    st.success(f"Re-extracted {len(all_dfs)} table(s) from {len(names)} file(s).")
+
+
+def _extract_and_store_notes():
+    """Build the notes corpus from any PDF in raw_upload_files_bytes, then
+    enrich notes referenced from the primary statements via Document AI."""
+    from modules.notes_parser import (
+        extract_notes_corpus,
+        detect_note_references,
+        enrich_notes_with_docai,
+    )
+
+    file_bytes = st.session_state.get("raw_upload_files_bytes") or {}
+    # Prefer the largest PDF — typical case is one annual-report PDF plus
+    # maybe an Excel working paper.
+    pdf_bytes = None
+    for name, data in file_bytes.items():
+        if name.lower().endswith(".pdf"):
+            if pdf_bytes is None or len(data) > len(pdf_bytes):
+                pdf_bytes = data
+    if not pdf_bytes:
+        return
+
+    with st.spinner("Extracting notes to the financial statements..."):
+        notes = extract_notes_corpus(pdf_bytes)
+    if not notes:
+        return
+
+    # Collect which notes are referenced from each classified statement
+    # (so we can star them in the UI and feed them to disaggregation later).
+    refs_by_stmt: dict[str, dict[int, list[int]]] = {}
+    for key in ("classified_pnl", "classified_bs", "classified_cf"):
+        df = st.session_state.get(key)
+        if df is None:
+            continue
+        stmt_refs = detect_note_references(df)
+        if stmt_refs:
+            refs_by_stmt[key] = stmt_refs
+
+    # Run Document AI on every note in parallel to extract structured
+    # breakdown tables. Notes longer than _MAX_NOTE_PAGES_FOR_DOCAI keep
+    # text only (caps cost and latency on rare multi-page schedules).
+    with st.spinner(
+        f"Extracting structured tables from {len(notes)} note(s) via Document AI..."
+    ):
+        notes = enrich_notes_with_docai(notes, pdf_bytes)
+
+    st.session_state["notes_corpus"] = notes
+    st.session_state["note_references"] = refs_by_stmt
 
 
 def _stmt_key(stmt_type: str) -> str:
@@ -190,7 +301,7 @@ def _stmt_key(stmt_type: str) -> str:
 
 
 def render_data_input():
-    st.header("Step 1: Data Input")
+    st.header("Step 1: Data Input & Classification")
 
     st.markdown(
         "Upload your financial statements. The tool **automatically identifies** whether "
@@ -200,7 +311,11 @@ def render_data_input():
 
     entity_type = st.session_state.get("entity_type", "General (non-financial)")
 
-    _render_previous_upload(entity_type)
+    # Reserve a slot at the top of the page for the "previous upload" /
+    # Reanalyse card. We fill it AFTER the upload tab has had a chance to
+    # persist newly-uploaded bytes, so the card reflects the latest state
+    # within the same render — no rerun gymnastics required.
+    reanalyse_slot = st.empty()
 
     tab_upload, tab_sample = st.tabs(["Upload File(s)", "Use Sample Data"])
 
@@ -241,6 +356,22 @@ def render_data_input():
                     uploaded.seek(0)
                 except Exception:
                     pass
+
+            # Persist file bytes immediately, before any "Confirm" click.
+            # Saves the user from losing their upload if extraction was poor
+            # and they want to Reanalyse with a parser improvement later.
+            if file_bytes:
+                existing = st.session_state.get("raw_upload_files_bytes") or {}
+                new_files = {
+                    k: v for k, v in file_bytes.items() if k not in existing
+                }
+                if new_files:
+                    existing.update(new_files)
+                    st.session_state["raw_upload_files_bytes"] = existing
+                    from modules.persistence import auto_save
+                    auto_save()
+
+            for uploaded in files:
                 with st.spinner(f"Processing {uploaded.name}..."):
                     df, tables = _load_file(uploaded)
 
@@ -364,6 +495,41 @@ def render_data_input():
                 )
                 st.rerun()
 
+    # Now fill the reserved slot at the top with the Reanalyse / previous-
+    # upload card. By rendering it here (after the upload tab has had its
+    # chance to persist newly-uploaded bytes), the card always reflects the
+    # latest session state — no rerun gymnastics required.
+    has_df = isinstance(st.session_state.get("raw_upload"), pd.DataFrame) \
+        and not st.session_state["raw_upload"].empty
+    has_bytes = bool(st.session_state.get("raw_upload_files_bytes"))
+    if has_df or has_bytes:
+        with reanalyse_slot.container():
+            _render_previous_upload(entity_type)
+
+    # Debug panel — collapsed by default. Helps diagnose state issues without
+    # needing screenshots: just expand and copy the contents back.
+    with st.expander("Debug info (state snapshot)", expanded=False):
+        files_info = st.session_state.get("raw_upload_files_bytes") or {}
+        file_summary = (
+            ", ".join(f"{k} ({len(v):,} bytes)" for k, v in files_info.items())
+            if files_info else "(empty)"
+        )
+        raw = st.session_state.get("raw_upload")
+        raw_summary = (
+            f"DataFrame, {len(raw)} rows, {len(raw.columns)} cols"
+            if isinstance(raw, pd.DataFrame) else "(absent)"
+        )
+        notes = st.session_state.get("notes_corpus") or {}
+        loaded_stmts = st.session_state.get("loaded_statements") or set()
+        st.code(
+            f"raw_upload_files_bytes: {file_summary}\n"
+            f"raw_upload: {raw_summary}\n"
+            f"loaded_statements: {sorted(loaded_stmts) if loaded_stmts else '(empty)'}\n"
+            f"notes_corpus: {len(notes)} notes\n"
+            f"signed_in: {bool(st.session_state.get('_persistence_loaded'))}\n",
+            language="text",
+        )
+
     # --- Current status ---
     loaded = st.session_state.get("loaded_statements", set())
     if loaded:
@@ -381,48 +547,75 @@ def render_data_input():
         st.sidebar.success(f"Loaded: {', '.join(sorted(loaded))}")
 
         # Entity context — auto-extracts what it can, prompts for the rest.
-        # Its answers feed the classifier in Step 2 (P&L) and all later steps.
         st.markdown("---")
         from modules.entity_context import render_context_form
         render_context_form()
+
+        # IFRS 18 classification editors — merged in from the former Step 2.
+        render_classification()
 
 
 def _render_previous_upload(entity_type: str):
     """Show the last saved upload with a button to rerun the analysis."""
     raw = st.session_state.get("raw_upload")
     source = st.session_state.get("raw_upload_source") or {}
-    if not isinstance(raw, pd.DataFrame) or raw.empty:
+    file_bytes = st.session_state.get("raw_upload_files_bytes") or {}
+
+    has_df = isinstance(raw, pd.DataFrame) and not raw.empty
+    has_bytes = bool(file_bytes)
+    if not has_df and not has_bytes:
         return
 
     src_type = source.get("type", "upload")
-    names = source.get("names") or []
+    names = source.get("names") or list(file_bytes.keys())
     label = "Sample data" if src_type == "sample" else "Uploaded file(s)"
 
     with st.container(border=True):
-        st.markdown(f"**Previous {label.lower()}** — {len(raw)} rows")
+        header = f"**Previous {label.lower()}**"
+        if has_df:
+            header += f" — {len(raw)} rows"
+        st.markdown(header)
         if names:
             st.caption(", ".join(names))
 
         col_a, col_b, col_c = st.columns([1, 1, 1])
         with col_a:
-            if st.button(
-                "Reanalyze",
-                type="primary",
-                help="Re-run classification on the previous upload "
-                     "(useful after changing entity type).",
-            ):
-                _process_and_store(raw.copy(), entity_type, source=source)
-                st.success("Reanalyzed with current entity settings.")
-                st.rerun()
+            # If we still have the original file bytes, "Reanalyse" re-runs the
+            # full pipeline (table extraction + classification + notes). This
+            # is what you want after a parser upgrade. If only the parsed df
+            # is left (older session with no saved bytes), fall back to
+            # re-classification only.
+            if has_bytes:
+                if st.button(
+                    "Reanalyse",
+                    type="primary",
+                    help="Re-run the full pipeline (extraction + classification "
+                         "+ notes) on the originally-uploaded file(s).",
+                ):
+                    _reextract_from_saved_files(entity_type)
+                    st.rerun()
+            elif has_df:
+                if st.button(
+                    "Reanalyse",
+                    type="primary",
+                    help="Re-classify the previous upload "
+                         "(useful after changing entity type).",
+                ):
+                    _process_and_store(raw.copy(), entity_type, source=source)
+                    st.success("Reanalysed with current entity settings.")
+                    st.rerun()
         with col_b:
-            with st.popover("Preview data"):
-                st.dataframe(raw, use_container_width=True, hide_index=True)
+            if has_df:
+                with st.popover("Preview data"):
+                    st.dataframe(raw, use_container_width=True, hide_index=True)
         with col_c:
             if st.button("Clear previous upload"):
                 for key in (
                     "raw_upload",
                     "raw_upload_source",
                     "raw_upload_files_bytes",
+                    "notes_corpus",
+                    "note_references",
                 ):
                     st.session_state.pop(key, None)
                 from modules.persistence import auto_save

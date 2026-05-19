@@ -10,7 +10,7 @@ st.set_page_config(
 )
 
 from modules.data_input import render_data_input
-from modules.classification import render_classification
+from modules.notes import render_notes
 from modules.pnl_analysis import render_pnl_analysis
 from modules.bs_analysis import render_bs_analysis
 from modules.cf_analysis_full import render_cf_analysis_full
@@ -43,8 +43,8 @@ def main():
     page = st.sidebar.radio(
         "Select Step",
         [
-            "1. Data Input",
-            "2. Classification",
+            "1. Data Input & Classification",
+            "2. Notes",
             "3. Income Statement (P&L)",
             "4. Balance Sheet",
             "5. Cash Flow Statement",
@@ -81,7 +81,7 @@ def main():
     if page.startswith("1"):
         render_data_input()
     elif page.startswith("2"):
-        render_classification()
+        render_notes()
     elif page.startswith("3"):
         render_pnl_analysis()
     elif page.startswith("4"):

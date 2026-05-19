@@ -26,7 +26,7 @@ def render_pnl_analysis():
     st.header("Step 3: Income Statement (P&L)")
 
     if "classified_pnl" not in st.session_state:
-        st.warning("Please complete Steps 1-2 first.")
+        st.warning("Please complete Step 1 first.")
         return
 
     df = st.session_state["classified_pnl"]

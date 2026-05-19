@@ -1,4 +1,7 @@
-"""Step 2: IFRS 18 Classification — review and adjust auto-detected classifications."""
+"""IFRS 18 Classification — review and adjust auto-detected classifications.
+
+Rendered inline inside Step 1 (Data Input) after data is loaded.
+"""
 
 import streamlit as st
 import pandas as pd
@@ -12,12 +15,16 @@ _CF_CATS = ["CF - Operating", "CF - Investing", "CF - Financing"]
 
 
 def render_classification():
-    st.header("Step 2: IFRS 18 Classification")
-
     loaded = st.session_state.get("loaded_statements", set())
     if not loaded:
-        st.warning("Please load data in Step 1 first.")
         return
+
+    st.markdown("---")
+    st.subheader("IFRS 18 Classification")
+    st.caption(
+        "Every item has been auto-classified. Review and adjust below — "
+        "changes flow into all downstream steps."
+    )
 
     entity_type = st.session_state.get("entity_type", "General (non-financial)")
     if entity_type != "General (non-financial)":
@@ -56,7 +63,7 @@ def render_classification():
         st.session_state["classifications_confirmed"] = True
         from modules.persistence import auto_save
         auto_save()
-        st.success("Classifications saved! Proceed to Step 3.")
+        st.success("Classifications saved! Proceed to Step 2 (Notes) or Step 3 (P&L).")
 
 
 def _amount_cols(df):
@@ -126,7 +133,7 @@ def _render_bs_section(df):
     st.markdown(
         "Balance sheet items are grouped into standard categories. "
         "IFRS 18 has minimal changes to BS presentation but introduces new "
-        "**aggregation and disaggregation** guidance (see Step 3)."
+        "**aggregation and disaggregation** guidance (see Step 3 — P&L)."
     )
 
     edited = st.data_editor(
