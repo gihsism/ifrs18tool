@@ -1,14 +1,20 @@
 """Parse financial statement tables from PDF, Word, and image files.
 
-Extraction strategies (tried in order, best result wins):
-1. pdfplumber table detection (5 strategies for different layouts)
-2. Word-position clustering (handles borderless tables)
-3. Layout-preserving text parsing (line-by-line)
-4. OCR (for scanned PDFs and images — pytesseract + Pillow)
+PDF extraction strategies (tried in order, first-one-that-works wins):
+1. Google Document AI Form Parser (ML model purpose-built for borderless
+   financial tables — handles real-world FS PDFs with narrative, notes,
+   subtotals, and multi-column layouts). Primary path.
+2. pdfplumber table detection (4 strategies for different layouts).
+3. Word-position clustering (handles borderless tables without ML).
+4. Layout-preserving text parsing (line-by-line).
+5. OCR (for scanned PDFs — pytesseract + Pillow).
+
+Paths 2–5 are fallbacks when Document AI is unavailable or returns nothing.
 
 Multi-page support: tables spanning pages are merged.
 """
 
+import os
 import re
 import io
 import logging
@@ -18,6 +24,11 @@ from collections import Counter
 from docx import Document
 
 logger = logging.getLogger(__name__)
+
+# Document AI config — overridable via env vars.
+_DOCAI_PROJECT = os.environ.get("DOCUMENT_AI_PROJECT", "ifrs18tool-15496")
+_DOCAI_LOCATION = os.environ.get("DOCUMENT_AI_LOCATION", "eu")
+_DOCAI_PROCESSOR_ID = os.environ.get("DOCUMENT_AI_PROCESSOR_ID", "d66b71583b1a1ebf")
 
 
 # ---------------------------------------------------------------------------
@@ -449,6 +460,253 @@ def extract_tables_from_image(file) -> list[pd.DataFrame]:
 
 
 # ---------------------------------------------------------------------------
+# Google Document AI — primary extraction path for PDFs
+# ---------------------------------------------------------------------------
+
+_DOCAI_SYNC_PAGE_LIMIT = 15  # Form Parser sync quota
+_DOCAI_SYNC_SIZE_LIMIT = 30 * 1024 * 1024
+
+# Keywords that identify primary financial statement pages. Matched against
+# lower-cased page text so we only send the pages that actually contain a
+# main FS form to Document AI — not the whole annual report.
+_PRIMARY_STATEMENT_KEYWORDS = [
+    # P&L / OCI
+    "statement of profit or loss",
+    "statement of comprehensive income",
+    "consolidated income statement",
+    "income statement",
+    "profit and loss account",
+    "statement of operations",
+    # Balance sheet
+    "statement of financial position",
+    "balance sheet",
+    # Cash flow
+    "statement of cash flows",
+    "statement of cash flow",
+    "cash flow statement",
+    "cashflow statement",
+    # Changes in equity (SoCE)
+    "statement of changes in equity",
+    "statement of changes in shareholders' equity",
+    "statement of changes in shareholders equity",
+    "statement of stockholders' equity",
+    "statement of stockholders equity",
+]
+
+
+def _pdf_page_count(pdf_bytes: bytes) -> int:
+    try:
+        from pypdf import PdfReader
+        return len(PdfReader(io.BytesIO(pdf_bytes)).pages)
+    except Exception:
+        return 0
+
+
+def _find_primary_statement_pages(pdf_bytes: bytes, max_scan: int = 300) -> list[int]:
+    """Locate primary-statement pages in a PDF.
+
+    Two-tier strategy:
+      1. **Keyword match** on lower-cased page text — the cheap, reliable
+         path for English-language FS.
+      2. **Number-density heuristic** — for non-English filings (German
+         "Bilanz", French "Bilan", multilingual reports, etc.) we score each
+         page by how many numeric tokens vs words it contains. The top
+         number-dense pages in the first half of the document are returned.
+
+    Returns a sorted, deduplicated list of 0-based page indexes plus the
+    following page (statements often span two pages for comparative columns).
+    """
+    hits: set[int] = set()
+    page_count = 0
+    try:
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            page_count = len(pdf.pages)
+            pages_text: list[str] = []
+            for i, page in enumerate(pdf.pages[:max_scan]):
+                try:
+                    text = page.extract_text() or ""
+                except Exception:
+                    text = ""
+                pages_text.append(text)
+                if any(kw in text.lower() for kw in _PRIMARY_STATEMENT_KEYWORDS):
+                    hits.add(i)
+                    if i + 1 < page_count:
+                        hits.add(i + 1)
+    except Exception:
+        return []
+
+    if hits:
+        return sorted(hits)
+
+    # Fallback: number-density heuristic. Pages with a high ratio of numeric
+    # tokens are likely primary statements. We bias toward earlier pages
+    # because primary statements normally appear before notes.
+    scores: list[tuple[int, float]] = []
+    for i, text in enumerate(pages_text):
+        if not text:
+            continue
+        tokens = text.split()
+        if len(tokens) < 20:
+            continue
+        num_tokens = sum(1 for t in tokens if _is_number_like(t))
+        density = num_tokens / max(len(tokens), 1)
+        # Bias: earlier pages get a small lift.
+        position_bias = max(0.0, 1.0 - (i / max(page_count, 1)) * 0.5)
+        scores.append((i, density * position_bias))
+
+    if not scores:
+        return []
+
+    # Take the top number-dense pages, capped at 12 to leave headroom inside
+    # the 15-page DocAI sync limit for adjacent-page expansion.
+    scores.sort(key=lambda x: x[1], reverse=True)
+    top = [i for i, score in scores[:12] if score > 0.15]
+    if not top:
+        return []
+
+    expanded: set[int] = set(top)
+    for i in top:
+        if i + 1 < page_count:
+            expanded.add(i + 1)
+    return sorted(expanded)[:15]
+
+
+def _pdf_subset(pdf_bytes: bytes, page_indexes: list[int]) -> bytes | None:
+    """Build a new PDF containing only the given 0-based pages."""
+    try:
+        from pypdf import PdfReader, PdfWriter
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        writer = PdfWriter()
+        for idx in page_indexes:
+            if 0 <= idx < len(reader.pages):
+                writer.add_page(reader.pages[idx])
+        out = io.BytesIO()
+        writer.write(out)
+        return out.getvalue()
+    except Exception as e:
+        logger.warning("pypdf subset failed: %s", e)
+        return None
+
+
+def _call_docai(pdf_bytes: bytes):
+    """Make one synchronous Document AI call. Returns the Document or None."""
+    try:
+        from google.cloud import documentai
+    except ImportError:
+        return None
+
+    try:
+        client = documentai.DocumentProcessorServiceClient(
+            client_options={
+                "api_endpoint": f"{_DOCAI_LOCATION}-documentai.googleapis.com"
+            }
+        )
+        name = (
+            f"projects/{_DOCAI_PROJECT}/locations/{_DOCAI_LOCATION}"
+            f"/processors/{_DOCAI_PROCESSOR_ID}"
+        )
+        request = documentai.ProcessRequest(
+            name=name,
+            raw_document=documentai.RawDocument(
+                content=pdf_bytes, mime_type="application/pdf",
+            ),
+        )
+        return client.process_document(request=request).document
+    except Exception as e:
+        logger.warning("Document AI call failed: %s", e)
+        return None
+
+
+def _extract_via_document_ai(file) -> list[tuple[pd.DataFrame, float]]:
+    """Extract tables from a PDF via Google Document AI Form Parser.
+
+    For PDFs ≤ 15 pages, sends the whole document. For larger PDFs (typical
+    annual reports), auto-detects the pages that contain primary statements
+    (P&L / BS / CF) and sends only those — keeping us under the sync quota
+    and the free-tier page budget.
+
+    Returns [] on any error so callers fall back to heuristics.
+    """
+    try:
+        file.seek(0)
+        pdf_bytes = file.read()
+    except Exception:
+        return []
+
+    if len(pdf_bytes) > _DOCAI_SYNC_SIZE_LIMIT:
+        return []
+
+    page_count = _pdf_page_count(pdf_bytes)
+
+    if page_count == 0 or page_count <= _DOCAI_SYNC_PAGE_LIMIT:
+        # Small PDF — send as-is.
+        payload = pdf_bytes
+    else:
+        # Large PDF — shrink to the primary-statement pages only.
+        candidate_pages = _find_primary_statement_pages(pdf_bytes)
+        if not candidate_pages:
+            logger.info(
+                "Document AI: %d-page PDF, no primary-statement titles detected; "
+                "falling back to heuristics.", page_count,
+            )
+            return []
+        if len(candidate_pages) > _DOCAI_SYNC_PAGE_LIMIT:
+            # Defensive truncation. Should rarely trip — a real FS rarely has
+            # more than 10-ish primary-statement pages.
+            candidate_pages = candidate_pages[:_DOCAI_SYNC_PAGE_LIMIT]
+        logger.info(
+            "Document AI: %d-page PDF, extracting pages %s",
+            page_count, [p + 1 for p in candidate_pages],
+        )
+        payload = _pdf_subset(pdf_bytes, candidate_pages)
+        if not payload:
+            return []
+
+    doc = _call_docai(payload)
+    if doc is None:
+        return []
+
+    full_text = doc.text or ""
+
+    def _layout_text(layout) -> str:
+        """Slice document.text using a Layout's text_anchor segments."""
+        if not layout or not layout.text_anchor or not layout.text_anchor.text_segments:
+            return ""
+        parts = []
+        for seg in layout.text_anchor.text_segments:
+            start = int(seg.start_index) if seg.start_index else 0
+            end = int(seg.end_index)
+            parts.append(full_text[start:end])
+        return "".join(parts).strip().replace("\n", " ")
+
+    candidates: list[tuple[pd.DataFrame, float]] = []
+    for page in doc.pages:
+        for table in page.tables:
+            rows = []
+            for header_row in table.header_rows:
+                rows.append([_layout_text(c.layout) for c in header_row.cells])
+            for body_row in table.body_rows:
+                rows.append([_layout_text(c.layout) for c in body_row.cells])
+
+            # Need at least a header + 2 data rows, and 2+ columns.
+            if len(rows) < 3 or not rows or len(rows[0]) < 2:
+                continue
+
+            # Normalise row widths (DocAI occasionally produces ragged rows).
+            width = max(len(r) for r in rows)
+            rows = [r + [""] * (width - len(r)) for r in rows]
+
+            df = pd.DataFrame(rows).fillna("")
+            score = _score_table(df)
+            # DocAI tables are already semantic — boost the floor so they beat
+            # fuzzy heuristic tables of similar raw score.
+            if score > 10:
+                candidates.append((df, score + 20))
+
+    return candidates
+
+
+# ---------------------------------------------------------------------------
 # PDF: multi-page table merging
 # ---------------------------------------------------------------------------
 
@@ -497,12 +755,20 @@ _PDFPLUMBER_STRATEGIES = [
 def extract_tables_from_pdf(file) -> list[pd.DataFrame]:
     """Extract financial tables from a PDF.
 
-    Opens the PDF once and iterates pages once, trying table-extraction
-    strategies in order and stopping as soon as the page yields a high-quality
-    result (so typical statements finish in one pass, not five). Falls back to
-    word-position clustering and finally OCR for scanned pages.
+    Combines two extractors and merges their candidates so we don't lose any
+    primary statement:
+      - Document AI Form Parser (best at borderless tables, semantic
+        row/column structure). Limited to 15-page subsets, so for full annual
+        reports we send only the detected primary-statement pages.
+      - pdfplumber + word-clustering + text fallback (per-page, free, full-PDF
+        coverage). Catches anything DocAI missed.
+    Both feed into the same dedupe/rank pipeline; the +20 score boost on DocAI
+    candidates means clean DocAI tables win when both extractors found them.
     """
     all_candidates: list[tuple[pd.DataFrame, float]] = []
+
+    # Primary path: Document AI on detected primary-statement pages.
+    all_candidates.extend(_extract_via_document_ai(file))
 
     try:
         file.seek(0)
@@ -576,6 +842,7 @@ def extract_tables_from_pdf(file) -> list[pd.DataFrame]:
     if len(results) > 1:
         results = _try_merge_pages(results)
 
+    logger.info("Extracted %d primary-statement tables from PDF", len(results))
     return results
 
 

@@ -1,16 +1,16 @@
 /**
- * Reverse-proxy alenanikolskaia.com/IFRS18analysis/* -> ifrs18tool.fly.dev.
+ * Reverse-proxy alenanikolskaia.com/IFRS18analysis/* -> Cloud Run.
  *
- * Streamlit runs with server.baseUrlPath = "IFRS18analysis" on Fly, so paths
- * match 1:1 — we just swap the hostname. All Streamlit-generated asset and
- * WebSocket URLs already include /IFRS18analysis, so the Worker's route
+ * Streamlit runs with server.baseUrlPath = "IFRS18analysis" on the origin, so
+ * paths match 1:1 — we just swap the hostname. All Streamlit-generated asset
+ * and WebSocket URLs already include /IFRS18analysis, so the Worker's route
  * (alenanikolskaia.com/IFRS18analysis*) catches every request.
  *
  * Same origin from the browser's point of view, which avoids Streamlit's
  * cross-origin CSRF block on file uploads.
  */
 
-const UPSTREAM_HOST = "ifrs18tool.fly.dev";
+const UPSTREAM_HOST = "ifrs18tool-645162687117.europe-west1.run.app";
 
 export default {
   async fetch(request: Request, _env: unknown, _ctx: ExecutionContext): Promise<Response> {
