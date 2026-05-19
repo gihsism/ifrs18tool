@@ -244,6 +244,36 @@ def _final_score(std_df: pd.DataFrame, raw_score: float) -> float:
     if avg_len < 15 and short > len(name_lengths) * 0.3:
         score -= 20
 
+    # Narrative-text rejection. On real-world annual reports the heuristic
+    # extractors (word clustering, line-by-line) happily turn paragraphs into
+    # "tables" — first column ends up holding fragments like "These costs
+    # arose f" or "the   five    other     major". Financial account names
+    # are short (1-6 words), don't end mid-word, and don't contain large
+    # internal whitespace runs.
+    def _looks_like_prose(text: str) -> bool:
+        s = str(text).strip()
+        if not s:
+            return False
+        words = s.split()
+        if len(words) > 8:
+            return True
+        # Last word is truncated (no terminal punctuation, ends mid-word)
+        if len(words) >= 3 and len(words[-1]) <= 4 and words[-1][-1].isalpha():
+            full = sum(1 for w in words if len(w) >= 6)
+            if full < 2:
+                return True
+        # 4+ consecutive spaces suggests column-bleed from a narrative layout
+        if "    " in s:
+            return True
+        return False
+
+    prose_rows = sum(1 for v in std_df["Account"] if _looks_like_prose(v))
+    prose_ratio = prose_rows / max(len(std_df), 1)
+    if prose_ratio > 0.3:
+        score -= 50  # very likely narrative misextraction
+    elif prose_ratio > 0.15:
+        score -= 25
+
     for col in amount_cols:
         zero_ratio = (std_df[col] == 0).sum() / max(len(std_df), 1)
         if zero_ratio > 0.5:
@@ -253,7 +283,12 @@ def _final_score(std_df: pd.DataFrame, raw_score: float) -> float:
 
 
 def _dedupe_and_rank(candidates: list[tuple[pd.DataFrame, float]]) -> list[pd.DataFrame]:
-    """Standardise, deduplicate, re-score, and rank candidate tables."""
+    """Standardise, deduplicate, re-score, and rank candidate tables.
+
+    Drops any candidate whose final score falls below the financial-table
+    floor — this is the main defence against narrative-text false positives
+    that the per-page heuristics happily produce on annual reports.
+    """
     final = []
     seen = set()
 
@@ -273,6 +308,11 @@ def _dedupe_and_rank(candidates: list[tuple[pd.DataFrame, float]]) -> list[pd.Da
         seen.add(sig)
 
         score = _final_score(std, raw_score)
+        # A real financial table almost always clears 35 on this scorer
+        # (year columns + multiple amounts + recognisable accounts). Below
+        # that we're in narrative-misextraction territory.
+        if score < 35:
+            continue
         final.append((std, score))
 
     final.sort(key=lambda x: x[1], reverse=True)
@@ -760,10 +800,13 @@ def extract_tables_from_pdf(file) -> list[pd.DataFrame]:
       - Document AI Form Parser (best at borderless tables, semantic
         row/column structure). Limited to 15-page subsets, so for full annual
         reports we send only the detected primary-statement pages.
-      - pdfplumber + word-clustering + text fallback (per-page, free, full-PDF
-        coverage). Catches anything DocAI missed.
+      - pdfplumber + word-clustering + text fallback (per-page, free). For
+        annual-report-sized PDFs this is also restricted to the detected
+        primary-statement pages — running it on every page of a 100-page
+        document turns narrative paragraphs into dozens of garbage "tables".
     Both feed into the same dedupe/rank pipeline; the +20 score boost on DocAI
-    candidates means clean DocAI tables win when both extractors found them.
+    candidates means clean DocAI tables win when both extractors found them,
+    and a hard score floor in dedupe drops any narrative misextraction.
     """
     all_candidates: list[tuple[pd.DataFrame, float]] = []
 
@@ -775,9 +818,31 @@ def extract_tables_from_pdf(file) -> list[pd.DataFrame]:
     except Exception:
         pass
 
+    # Decide which pages the heuristic sweep should look at. For small PDFs
+    # (≤ DocAI sync limit) we look at everything; for larger reports we use
+    # the same primary-statement-page detection that DocAI used, so the
+    # heuristics complement DocAI on the SAME pages instead of dredging
+    # narrative chapters elsewhere in the report.
+    try:
+        file.seek(0)
+        pdf_bytes_for_pages = file.read()
+        file.seek(0)
+    except Exception:
+        pdf_bytes_for_pages = b""
+
+    page_filter: set[int] | None = None
+    if pdf_bytes_for_pages:
+        page_count = _pdf_page_count(pdf_bytes_for_pages)
+        if page_count > _DOCAI_SYNC_PAGE_LIMIT:
+            detected = _find_primary_statement_pages(pdf_bytes_for_pages)
+            if detected:
+                page_filter = set(detected)
+
     try:
         with pdfplumber.open(file) as pdf:
-            for page in pdf.pages:
+            for page_idx, page in enumerate(pdf.pages):
+                if page_filter is not None and page_idx not in page_filter:
+                    continue
                 page_got_good_table = False
 
                 # Try structured table extraction with early-exit.
