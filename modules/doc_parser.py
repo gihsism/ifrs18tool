@@ -510,6 +510,7 @@ _DOCAI_SYNC_SIZE_LIMIT = 30 * 1024 * 1024
 # lower-cased page text so we only send the pages that actually contain a
 # main FS form to Document AI — not the whole annual report.
 _PRIMARY_STATEMENT_KEYWORDS = [
+    # --- English -----------------------------------------------------------
     # P&L / OCI
     "statement of profit or loss",
     "statement of comprehensive income",
@@ -531,6 +532,44 @@ _PRIMARY_STATEMENT_KEYWORDS = [
     "statement of changes in shareholders equity",
     "statement of stockholders' equity",
     "statement of stockholders equity",
+    # --- German (Swisscom / Roche / SAP / DACH) ----------------------------
+    "konzernerfolgsrechnung",
+    "konzern-erfolgsrechnung",
+    "erfolgsrechnung",
+    "gewinn- und verlustrechnung",
+    "gewinn-und-verlustrechnung",
+    "gesamtergebnisrechnung",
+    "konzernbilanz",
+    "bilanz",
+    "konzerngeldflussrechnung",
+    "geldflussrechnung",
+    "kapitalflussrechnung",
+    "mittelflussrechnung",
+    "eigenkapitalveränderungsrechnung",
+    "veränderung des eigenkapitals",
+    # --- French (Suisse-romande / FR) --------------------------------------
+    "compte de résultat",
+    "compte de resultat",
+    "état du résultat global",
+    "etat du resultat global",
+    "résultat consolidé",
+    "resultat consolide",
+    "bilan consolidé",
+    "bilan consolide",
+    "état de la situation financière",
+    "etat de la situation financiere",
+    "tableau des flux de trésorerie",
+    "tableau des flux de tresorerie",
+    "état des variations des capitaux propres",
+    "etat des variations des capitaux propres",
+    # --- Italian (Ticino / IT) --------------------------------------------
+    "conto economico",
+    "conto economico complessivo",
+    "stato patrimoniale",
+    "situazione patrimoniale-finanziaria",
+    "situazione patrimoniale finanziaria",
+    "rendiconto finanziario",
+    "prospetto delle variazioni del patrimonio netto",
 ]
 
 

@@ -49,11 +49,28 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _NOTES_SECTION_MARKERS = [
+    # English
     "notes to the consolidated financial statements",
     "notes to the financial statements",
     "notes to the group financial statements",
     "notes to the company financial statements",
     "notes to the accounts",
+    # German (Swiss / DACH filings)
+    "anhang zur konzernrechnung",
+    "anhang zum konzernabschluss",
+    "anhang zur jahresrechnung",
+    "anhang zum jahresabschluss",
+    "erläuterungen zum konzernabschluss",
+    "erläuterungen zum jahresabschluss",
+    # French (Swiss-romand / FR filings)
+    "notes aux comptes consolidés",
+    "notes aux états financiers",
+    "annexe aux comptes consolidés",
+    "annexe aux états financiers",
+    # Italian (Ticino / IT filings)
+    "note al bilancio consolidato",
+    "note al bilancio",
+    "note esplicative",
 ]
 
 # A note heading looks like one of:
@@ -70,10 +87,29 @@ _NOTES_SECTION_MARKERS = [
 #  - a title of at least 3 characters starting with an uppercase letter
 #  - line ends after the title (no trailing amounts — that's a table row)
 _NOTE_HEADING_RE = re.compile(
-    r"^\s*(?:note\s+)?[\(\[]?(\d{1,3})[\)\]]?\s*[\.\:\-–—]?\s+"
-    r"([A-Z][A-Za-z0-9 &,\-/'()–—]{2,120})\s*$",
+    r"^\s*(?:note|anhang|nota)?\s*[\(\[]?(\d{1,3})[\)\]]?\s*[\.\:\-–—]?\s+"
+    # Title — Latin-1 + common accents (German ä/ö/ü/ß, French é/è/ê/à/ç,
+    # Italian à/è/ì/ò/ù). Must include a real letter at the start.
+    r"([A-Za-zÀ-ÿ][A-Za-zÀ-ÿ0-9 &,\-/'()–—]{2,120})\s*$",
     re.IGNORECASE | re.MULTILINE,
 )
+
+
+def _looks_like_real_note_title(title: str) -> bool:
+    """A real note title is short — a few words at most.
+
+    Rejects long run-on false positives like
+    'FacilityNetCapacityinmegawatts(MW)representsthelesserof...' (100+
+    chars) that pdfplumber produces when a stray '1' is followed by
+    paragraph text. We only check length here: requiring spaces or
+    sane word lengths breaks real titles in PDFs where pdfplumber
+    happens to lose space characters entirely (common with kerned
+    Helvetica narrative — e.g. Berkshire 2023).
+    """
+    title = (title or "").strip()
+    if len(title) < 3 or len(title) > 80:
+        return False
+    return True
 
 
 def _find_notes_section_start(pages_text: list[str]) -> int | None:
@@ -105,8 +141,11 @@ def _find_notes_start_by_heading(
                 continue
             for line in text.splitlines():
                 m = _NOTE_HEADING_RE.match(line)
-                if m and int(m.group(1)) == target_first_num:
-                    return i
+                if not m or int(m.group(1)) != target_first_num:
+                    continue
+                if not _looks_like_real_note_title(m.group(2)):
+                    continue
+                return i
     return None
 
 
@@ -153,6 +192,12 @@ def _segment_notes(pages_text: list[str], start_page: int) -> dict[int, dict]:
                     continue
                 if current_num is not None and num > current_num + 20:
                     # Huge jump — probably a spurious match (e.g. "2026 figures").
+                    current_buf.append(line)
+                    continue
+                # Title must look real (rejects glued-word false positives
+                # where pdfplumber's word extraction lost spaces inside a
+                # paragraph that begins with a "1").
+                if not _looks_like_real_note_title(title):
                     current_buf.append(line)
                     continue
                 _flush(page_idx)
