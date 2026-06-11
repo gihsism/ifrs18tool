@@ -256,6 +256,74 @@ def detect_note_references(classified_df: pd.DataFrame) -> dict[int, list[int]]:
     return refs
 
 
+# Words too generic to carry a title match on their own (multi-language).
+_TITLE_STOPWORDS = {
+    "and", "of", "the", "for", "from", "net", "total",
+    "und", "der", "die", "das", "zum", "zur", "aus",
+    "de", "la", "le", "les", "des", "du", "et", "aux",
+    "di", "del", "della", "delle", "dei", "e", "ed", "al", "alle",
+}
+
+
+def _title_tokens(label: str) -> frozenset[str]:
+    """Normalise an account label or note title into a comparable token set.
+
+    Drops parenthesised tails (note refs, units), punctuation, stopwords
+    and short fragments so 'Other operating expenses (Note 12)' and
+    '12. Other operating expenses' produce the same set.
+    """
+    label = re.sub(r"\(.*?\)", " ", (label or "").lower())
+    label = re.sub(r"[^a-zà-ÿ0-9]+", " ", label)
+    return frozenset(
+        t for t in label.split()
+        if len(t) > 2 and t not in _TITLE_STOPWORDS and not t.isdigit()
+    )
+
+
+def match_notes_by_title(
+    classified_df: pd.DataFrame,
+    notes_corpus: dict[int, dict],
+    min_score: float = 0.6,
+) -> dict[int, list[int]]:
+    """Link statement lines to notes by title similarity.
+
+    Fallback for reports that don't print note references on the face of
+    the statements — a line 'Finance costs' still links to the note titled
+    'Finance costs'. Jaccard overlap on normalised token sets; only
+    confident matches (>= min_score) are returned.
+
+    Returns {row_index: [note_num]} in the same shape as
+    detect_note_references.
+    """
+    refs: dict[int, list[int]] = {}
+    if "Account" not in classified_df.columns or not notes_corpus:
+        return refs
+
+    note_tokens = {
+        num: _title_tokens(note.get("title", ""))
+        for num, note in notes_corpus.items()
+    }
+
+    for idx, acct in classified_df["Account"].items():
+        acct_tokens = _title_tokens(str(acct))
+        if not acct_tokens:
+            continue
+        best_num, best_score = None, 0.0
+        for num, tokens in note_tokens.items():
+            if not tokens:
+                continue
+            inter = acct_tokens & tokens
+            if not inter:
+                continue
+            score = len(inter) / len(acct_tokens | tokens)
+            if score > best_score:
+                best_num, best_score = num, score
+        if best_num is not None and best_score >= min_score:
+            refs[int(idx)] = [best_num]
+
+    return refs
+
+
 # ---------------------------------------------------------------------------
 # Main entry: build notes corpus from PDF bytes
 # ---------------------------------------------------------------------------

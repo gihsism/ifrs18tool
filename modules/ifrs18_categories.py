@@ -50,7 +50,7 @@ IFRS18_PNL_RULES = {
         "cost of revenue",
         "gross profit", "selling", "distribution", "marketing",
         "administrative", "admin", "general expense",
-        "staff cost", "employee",
+        "staff cost", "employee", "personnel",
         "wages", "salaries",
         "depreciation", "amortisation", "amortization",
         "impairment", "write-down", "write-off",
@@ -61,25 +61,50 @@ IFRS18_PNL_RULES = {
         "rent expense", "lease expense",
         "foreign exchange", "fx gain", "fx loss",
         "gain on disposal of ppe", "loss on disposal of ppe",
+        "disposal of property",
         "pension service cost", "defined benefit service",
         "other income", "other expense",
         "insurance revenue", "insurance service",
+        # German
+        "umsatzerlöse", "umsatz", "herstellungskosten", "vertriebskosten",
+        "verwaltungskosten", "verwaltungsaufwand", "abschreibungen",
+        "personalaufwand", "wertminderung", "sonstige betriebliche",
+        "forschung und entwicklung", "materialaufwand",
+        # French
+        "chiffre d'affaires", "produits des activités ordinaires",
+        "coût des ventes", "frais de vente", "frais administratifs",
+        "frais généraux", "amortissements", "dépréciation",
+        "charges de personnel", "frais de recherche",
+        # Italian
+        "ricavi", "costo del venduto", "costi di vendita",
+        "costi amministrativi", "ammortamenti", "svalutazioni",
+        "costi del personale", "costi di ricerca",
     ],
     IFRS18Category.INVESTING: [
         "dividend income", "dividend received",
         "interest income", "interest received",
-        "investment income",
+        "investment income", "finance income",
         "rental income",
         "fair value gain", "fair value loss",
         "gain on disposal of investment", "loss on disposal of investment",
         "gain on disposal of subsidiary",
         "share of profit", "share of loss", "equity method",
+        "share of result of associates", "share of net income of associates",
         "revaluation gain", "revaluation loss",
+        # German
+        "zinsertrag", "zinserträge", "finanzertrag", "beteiligungsergebnis",
+        "dividendenertrag", "ergebnis aus assoziierten",
+        # French
+        "produits financiers", "produits d'intérêts", "dividendes reçus",
+        "quote-part dans le résultat",
+        # Italian
+        "proventi finanziari", "interessi attivi", "dividendi",
+        "quota di utile",
     ],
     IFRS18Category.FINANCING: [
         "interest expense", "interest paid", "finance cost", "finance charge",
         "borrowing cost", "loan interest", "bond interest",
-        "lease interest", "unwinding of discount",
+        "lease interest", "interest on lease liabilit", "unwinding of discount",
         "fair value change on financial liabilit",
         "bank charge", "commitment fee",
         "net interest on defined benefit",
@@ -87,15 +112,42 @@ IFRS18_PNL_RULES = {
         "exchange loss on borrowing", "exchange gain on borrowing",
         "fx on debt", "fx on loan",
         "foreign exchange loss on borrowing", "foreign exchange gain on borrowing",
+        # German
+        "zinsaufwand", "zinsaufwendungen", "finanzaufwand",
+        "finanzierungsaufwand", "fremdkapitalkosten",
+        # French
+        "charges financières", "charges d'intérêts", "coût de l'endettement",
+        # Italian
+        "oneri finanziari", "interessi passivi",
     ],
     IFRS18Category.INCOME_TAX: [
         "income tax", "tax expense", "tax benefit",
         "current tax", "deferred tax",
         "withholding tax",
+        # German
+        "ertragssteuern", "ertragsteuern", "steueraufwand", "latente steuern",
+        # French
+        "impôts sur le résultat", "impôt sur les bénéfices",
+        "impôts différés", "charge d'impôt",
+        # Italian
+        "imposte sul reddito", "imposte correnti", "imposte differite",
     ],
     IFRS18Category.DISCONTINUED: [
         "discontinued", "held for sale",
+        # German
+        "aufgegebene geschäftsbereiche", "zur veräusserung gehalten",
+        "zur veräußerung gehalten",
+        # French
+        "activités abandonnées",
+        # Italian
+        "attività operative cessate", "attività cessate",
     ],
+}
+
+# Keywords that match a description but don't really pin down the category —
+# a supporting note (when one is referenced) is allowed to override these.
+WEAK_PNL_KEYWORDS = {
+    "other income", "other expense",
 }
 
 # For financial entities, these keywords reclassify to Operating
@@ -182,47 +234,84 @@ BS_CLASSIFICATION_RULES = {
 # Classification functions
 # ===================================================================
 
+# Scan order for length ties: the more specific (non-operating) category wins.
+_PNL_PRIORITY = [
+    IFRS18Category.DISCONTINUED,
+    IFRS18Category.INCOME_TAX,
+    IFRS18Category.FINANCING,
+    IFRS18Category.INVESTING,
+    IFRS18Category.OPERATING,
+]
+
+
+def _scan_pnl_keywords(
+    text: str, entity_type: str,
+) -> tuple[IFRS18Category | None, str]:
+    """Longest-keyword match over `text`. Returns (category, keyword) or
+    (None, "") when nothing matches.
+
+    Longest-match beats the old first-match-wins scan: "net interest on
+    defined benefit" (Financing) now wins over "interest income" embedded
+    in a longer label, and a banking override only wins where it is
+    genuinely the most specific match.
+    """
+    best_cat: IFRS18Category | None = None
+    best_kw = ""
+
+    # Financial entity overrides -> Operating. Scanned first so they win
+    # length ties against the generic rules for the same term.
+    if entity_type != "General (non-financial)":
+        for keyword in FINANCIAL_ENTITY_OVERRIDES.get(entity_type, []):
+            if keyword in text and len(keyword) > len(best_kw):
+                best_cat, best_kw = IFRS18Category.OPERATING, keyword
+
+    for category in _PNL_PRIORITY:
+        for keyword in IFRS18_PNL_RULES.get(category, []):
+            if keyword in text and len(keyword) > len(best_kw):
+                best_cat, best_kw = category, keyword
+
+    return best_cat, best_kw
+
+
+def classify_pnl_item_detailed(
+    description: str,
+    entity_type: str = "General (non-financial)",
+    note_context: str = "",
+) -> tuple[IFRS18Category, str, str]:
+    """Classify a P&L line item into an IFRS 18 category.
+
+    Returns (category, matched_keyword, source) where source is
+    "description", "note", or "default".
+
+    The description is authoritative: a clearly-labelled line ("Revenue")
+    keeps its category even if the supporting note happens to mention
+    "interest income" in passing. `note_context` (title + first ~500 chars
+    of the referenced footnote) is consulted only when the description is
+    ambiguous — no keyword match, or a weak match like "Other income".
+    """
+    desc = description.lower().strip()
+    cat, kw = _scan_pnl_keywords(desc, entity_type)
+
+    desc_is_weak = cat is None or kw in WEAK_PNL_KEYWORDS
+    if note_context and desc_is_weak:
+        ctx_cat, ctx_kw = _scan_pnl_keywords(
+            note_context[:500].lower(), entity_type,
+        )
+        if ctx_cat is not None and ctx_kw not in WEAK_PNL_KEYWORDS:
+            return ctx_cat, ctx_kw, "note"
+
+    if cat is not None:
+        return cat, kw, "description"
+    return IFRS18Category.OPERATING, "", "default"
+
+
 def classify_pnl_item(
     description: str,
     entity_type: str = "General (non-financial)",
     note_context: str = "",
 ) -> IFRS18Category:
-    """Classify a P&L line item into an IFRS 18 category.
-
-    `note_context` is optional text from the supporting footnote — used to
-    disambiguate items like "Interest" or "Other income" whose category
-    depends on what's *behind* the line. We restrict the note context to
-    the first ~500 chars to keep the keyword scan tight and avoid spurious
-    matches deep inside a long disclosure narrative.
-    """
-    base = description.lower().strip()
-    desc_lower = (
-        base + " " + note_context[:500].lower()
-        if note_context else base
-    )
-
-    # Financial entity overrides -> Operating
-    if entity_type != "General (non-financial)":
-        overrides = FINANCIAL_ENTITY_OVERRIDES.get(entity_type, [])
-        for keyword in overrides:
-            if keyword in desc_lower:
-                return IFRS18Category.OPERATING
-
-    # Check non-operating categories first (Operating is the residual)
-    priority_order = [
-        IFRS18Category.DISCONTINUED,
-        IFRS18Category.INCOME_TAX,
-        IFRS18Category.FINANCING,
-        IFRS18Category.INVESTING,
-        IFRS18Category.OPERATING,
-    ]
-    for category in priority_order:
-        keywords = IFRS18_PNL_RULES.get(category, [])
-        for keyword in keywords:
-            if keyword in desc_lower:
-                return category
-
-    return IFRS18Category.OPERATING
+    """Classify a P&L line item into an IFRS 18 category."""
+    return classify_pnl_item_detailed(description, entity_type, note_context)[0]
 
 
 def classify_bs_item(description: str) -> BSCategory:

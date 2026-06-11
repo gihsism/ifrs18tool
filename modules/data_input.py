@@ -182,7 +182,7 @@ def _process_and_store(df: pd.DataFrame, entity_type: str, source: dict | None =
 
     # Extract notes corpus from the original PDF (if any). Runs inline so the
     # user sees notes ready by the time they navigate to Step 2.
-    _extract_and_store_notes()
+    _extract_and_store_notes(entity_type)
 
     # Auto-save to disk
     from modules.persistence import auto_save
@@ -243,12 +243,13 @@ def _reextract_from_saved_files(entity_type: str):
     st.success(f"Re-extracted {len(all_dfs)} table(s) from {len(names)} file(s).")
 
 
-def _extract_and_store_notes():
+def _extract_and_store_notes(entity_type: str):
     """Build the notes corpus from any PDF in raw_upload_files_bytes, then
     enrich notes referenced from the primary statements via Document AI."""
     from modules.notes_parser import (
         extract_notes_corpus,
         detect_note_references,
+        match_notes_by_title,
         enrich_notes_with_docai,
     )
 
@@ -270,12 +271,17 @@ def _extract_and_store_notes():
 
     # Collect which notes are referenced from each classified statement
     # (so we can star them in the UI and feed them to disaggregation later).
+    # Explicit "(Note 12)" references win; lines without one fall back to
+    # title similarity against the note headings, so reports that don't
+    # print note refs on the face still get linked.
     refs_by_stmt: dict[str, dict[int, list[int]]] = {}
     for key in ("classified_pnl", "classified_bs", "classified_cf"):
         df = st.session_state.get(key)
         if df is None:
             continue
         stmt_refs = detect_note_references(df)
+        for row_idx, note_nums in match_notes_by_title(df, notes).items():
+            stmt_refs.setdefault(row_idx, note_nums)
         if stmt_refs:
             refs_by_stmt[key] = stmt_refs
 

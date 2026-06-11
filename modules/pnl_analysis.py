@@ -6,6 +6,7 @@ Tabs: Impact Assessment | Aggregation & Disaggregation | IFRS 18 Statement | MPM
 import streamlit as st
 import pandas as pd
 import io
+import re
 import plotly.express as px
 import plotly.graph_objects as go
 from modules.ifrs18_categories import IFRS18Category
@@ -308,19 +309,42 @@ IFRS 18 provides enhanced guidance on aggregation/disaggregation:
 The following must be disclosed by nature when function presentation is used:
 """)
         nature_required = {
-            "Depreciation": "depreciation",
-            "Amortisation": "amortisation",
-            "Employee benefits expense": "employee",
-            "Write-down of inventories": "inventory write",
-            "Impairment losses": "impairment",
+            "Depreciation": ["depreciation", "abschreibung", "amortissement", "ammortament"],
+            "Amortisation": ["amortisation", "amortization"],
+            "Employee benefits expense": ["employee", "personnel", "staff cost",
+                                          "personalaufwand", "charges de personnel",
+                                          "costi del personale"],
+            "Write-down of inventories": ["inventory write", "write-down of inventor"],
+            "Impairment losses": ["impairment", "wertminderung", "dépréciation",
+                                  "svalutazion"],
         }
-        for label, kw in nature_required.items():
-            found = any(kw in a for a in accts)
-            amounts = df[df["Account"].str.lower().str.contains(kw, na=False)][col].sum()
-            if found:
-                st.markdown(f"- {label}: **{amounts:,.0f}** (found in data)")
+        notes_corpus = st.session_state.get("notes_corpus") or {}
+        for label, kws in nature_required.items():
+            mask = df["Account"].str.lower().str.contains(
+                "|".join(kws), na=False, regex=True,
+            )
+            if mask.any():
+                st.markdown(f"- {label}: **{df[mask][col].sum():,.0f}** (on the face of the P&L)")
+                continue
+            # Not on the face — is it disclosed in a note?
+            note_hits = [
+                (n, note.get("title", ""))
+                for n, note in sorted(notes_corpus.items())
+                if any(
+                    kw in (note.get("title", "") + " " + note.get("text", "")).lower()
+                    for kw in kws
+                )
+            ]
+            if note_hits:
+                refs = ", ".join(
+                    f"Note {n}" + (f" ({t})" if t else "") for n, t in note_hits[:3]
+                )
+                st.markdown(f"- {label}: _Not on face — disclosed in {refs}_")
             else:
-                st.markdown(f"- {label}: _Not found — must be disclosed in notes_")
+                st.markdown(
+                    f"- {label}: _**Not found on face or in notes** — "
+                    f"potential disclosure gap under IFRS 18_"
+                )
 
     elif len(nat_items) > len(func_items):
         st.success(
@@ -359,6 +383,47 @@ The following must be disclosed by nature when function presentation is used:
         st.caption(f"Reduced from {len(df)} to {len(preview)} line items")
 
     _render_note_disaggregation(df, col)
+
+
+_AMOUNT_RE = re.compile(r"^\(?-?\d[\d'’,.\s ]*\)?$")
+
+
+def _parse_cell_amount(value) -> float | None:
+    """Parse a note-table cell into a float, or None if it isn't an amount.
+
+    Handles thousands separators (1,234 / 1'234 / 1 234), decimal points,
+    and accounting-style negatives in parentheses.
+    """
+    s = str(value).strip()
+    if not s or not _AMOUNT_RE.match(s):
+        return None
+    negative = s.startswith("(") and s.endswith(")")
+    s = re.sub(r"[()'’,\s ]", "", s)
+    # A trailing .00-style decimal survives; bare separators are gone.
+    try:
+        f = float(s)
+    except ValueError:
+        return None
+    return -f if negative else f
+
+
+def _note_ties_to_amount(tables, amount, tol_pct=0.005) -> bool:
+    """True if any cell in the note's tables matches the P&L line amount
+    (sign-insensitive, small rounding tolerance)."""
+    try:
+        target = abs(float(amount))
+    except (TypeError, ValueError):
+        return False
+    if target == 0:
+        return False
+    tolerance = max(1.0, target * tol_pct)
+    for tbl in tables:
+        for column in tbl.columns:
+            for cell in tbl[column]:
+                f = _parse_cell_amount(cell)
+                if f is not None and abs(abs(f) - target) <= tolerance:
+                    return True
+    return False
 
 
 def _render_note_disaggregation(df, col):
@@ -401,11 +466,25 @@ def _render_note_disaggregation(df, col):
             title = note.get("title") or ""
             tables = note.get("tables") or []
             text = (note.get("text") or "").strip()
+            ties = _note_ties_to_amount(tables, amount) if tables else False
+            tie_marker = " ✓" if ties else ""
             with st.expander(
-                f"**{acct}** — {category} — {amount:,.0f}  →  Note {n}: {title}",
+                f"**{acct}** — {category} — {amount:,.0f}  →  Note {n}: {title}{tie_marker}",
                 expanded=False,
             ):
                 if tables:
+                    if ties:
+                        st.success(
+                            f"The note contains an amount matching the P&L line "
+                            f"({amount:,.0f}) — the breakdown ties to the face of the statement."
+                        )
+                    else:
+                        st.warning(
+                            f"No amount in the note matches the P&L line ({amount:,.0f}). "
+                            f"The note may cover a different scope (e.g. gross vs net, "
+                            f"multi-line) — check before relying on this breakdown "
+                            f"for disaggregation."
+                        )
                     for ti, tbl in enumerate(tables):
                         st.markdown(
                             f"_Table {ti + 1} from Note {n}:_"
